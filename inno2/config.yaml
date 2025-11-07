@@ -1,0 +1,76 @@
+# 创新点2 配置文件
+
+# 数据配置
+data:
+  csv_path: "inno2.csv"
+  img_size: 256
+  batch_size: 8
+  num_workers: 4
+  train_split: 0.9
+
+# 模型配置
+model:
+  base_channels: 64
+  style_dim: 256
+  num_blocks: 4
+  in_channels: 3
+  out_channels: 3
+
+# 训练配置
+training:
+  # 阶段设置
+  phase_a_epochs: 50
+  phase_b_epochs: 50
+  
+  # 优化器
+  lr_g: 0.0001
+  lr_d: 0.0001
+  betas: [0.5, 0.999]
+  
+  # 学习率调度
+  scheduler: "cosine"
+  
+  # 损失权重
+  loss_weights:
+    # Phase A
+    lambda_l1: 1.0
+    lambda_l2: 1.0
+    lambda_ssim: 1.0
+    lambda_tv: 0.1
+    
+    # Phase B
+    lambda_nce: 0.1
+    lambda_domain: 0.1
+    lambda_mmd: 0.01
+  
+  # 其他
+  gradient_clip: 5.0
+  d_steps: 1  # 判别器更新频率
+
+# 数据增强
+augmentation:
+  random_flip: true
+  flip_prob: 0.5
+  random_rotation: true
+  rotation_degrees: 10
+  color_jitter: true
+  brightness: 0.1
+  contrast: 0.1
+  saturation: 0.1
+  hue: 0.05
+
+# 推理配置
+inference:
+  threshold: 0.1  # 异常检测阈值
+  colormap: "jet"  # 热力图颜色
+  overlay_alpha: 0.4
+
+# 其他
+device: "cuda"
+save_dir: "checkpoints"
+log_dir: "logs"
+results_dir: "results"
+use_wandb: false
+wandb_project: "inno2-cross-modal"
+seed: 42
+
