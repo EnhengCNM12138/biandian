@@ -155,6 +155,93 @@ class AdaptiveInstanceNorm2d(nn.Module):
         return (1 + gamma) * normalized + beta
 
 
+class SPADE(nn.Module):
+    """Spatially-Adaptive Denormalization (简化版)，以结构特征为像素级条件。"""
+    def __init__(self, norm_channels: int, cond_channels: int, hidden: int = 128):
+        super().__init__()
+        self.norm = nn.InstanceNorm2d(norm_channels, affine=False)
+        # 门控，确保初始为近似恒等映射
+        self.gate = nn.Parameter(torch.tensor(0.0))
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(cond_channels, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.mlp_gamma = nn.Conv2d(hidden, norm_channels, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(hidden, norm_channels, kernel_size=3, padding=1)
+        # 初始化为恒等变换：gamma≈0, beta≈0，避免早期不稳定
+        nn.init.zeros_(self.mlp_gamma.weight); nn.init.zeros_(self.mlp_gamma.bias)
+        nn.init.zeros_(self.mlp_beta.weight); nn.init.zeros_(self.mlp_beta.bias)
+    
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.mlp_shared(cond)
+        gamma = self.mlp_gamma(h)
+        beta = self.mlp_beta(h)
+        x_norm = self.norm(x)
+        x_spade = (1 + gamma) * x_norm + beta
+        gate = torch.tanh(self.gate)  # [-1,1]，初始≈0，逐步放开
+        return x + gate * (x_spade - x)
+
+
+class PhysicsFiLM(nn.Module):
+    """基于环境物理先验的FiLM调制（标量级）。"""
+    def __init__(self, num_features: int, env_dim: int):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(env_dim, num_features * 2)
+        )
+        # 恒等初始化：gamma≈0, beta≈0
+        for m in self.fc.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+    
+    def forward(self, x: torch.Tensor, env_vec: torch.Tensor) -> torch.Tensor:
+        # env_vec: [B, E]
+        gamma_beta = self.fc(env_vec)  # [B, 2*C]
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        return x * (1 + gamma) + beta
+
+
+class CrossAttention2D(nn.Module):
+    """跨注意力：用style tokens调制空间特征。"""
+    def __init__(self, channels: int, token_dim: int, num_tokens: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (channels // num_heads) ** -0.5
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Linear(token_dim, channels)
+        self.v_proj = nn.Linear(token_dim, channels)
+        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.num_tokens = num_tokens
+        # 学习门控，初始为0，避免早期注意力扰动过大
+        self.attn_gate = nn.Parameter(torch.tensor(0.0))
+    
+    def forward(self, x: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W], tokens: [B, T, D]
+        b, c, h, w = x.shape
+        q = self.q_proj(x).view(b, c, h * w).transpose(1, 2)  # [B, HW, C]
+        k = self.k_proj(tokens)  # [B, T, C]
+        v = self.v_proj(tokens)  # [B, T, C]
+        
+        # 多头分组
+        def split_heads(t: torch.Tensor) -> torch.Tensor:
+            # [B, N, C] -> [B, heads, N, C//heads]
+            return t.view(b, -1, self.num_heads, c // self.num_heads).transpose(1, 2)
+        qh = split_heads(q)
+        kh = split_heads(k)
+        vh = split_heads(v)
+        
+        attn = torch.matmul(qh, kh.transpose(-2, -1)) * self.scale  # [B, heads, HW, T]
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, vh)  # [B, heads, HW, C//heads]
+        out = out.transpose(1, 2).contiguous().view(b, h * w, c)
+        out = out.transpose(1, 2).view(b, c, h, w)
+        out = self.out_proj(out)
+        gate = torch.tanh(self.attn_gate)  # 限制到[-1,1]
+        return x + gate * out
+
+
 
 class ResidualBlock(nn.Module):
     """残差块"""
@@ -174,6 +261,55 @@ class ResidualBlock(nn.Module):
         out += residual
         out = self.relu(out)
         return out
+
+
+def icnr_init(conv_weight: torch.Tensor, scale: int = 2, init=nn.init.kaiming_normal_) -> None:
+    """ICNR init for PixelShuffle to reduce checkerboard artifacts."""
+    out_channels, in_channels, kH, kW = conv_weight.shape
+    r2 = scale ** 2
+    if out_channels % r2 != 0:
+        return
+    new_out = out_channels // r2
+    kernel = torch.zeros(new_out, in_channels, kH, kW, device=conv_weight.device)
+    init(kernel)
+    kernel = kernel.repeat_interleave(r2, dim=0)
+    with torch.no_grad():
+        conv_weight.copy_(kernel)
+
+'''class UpShuffle(nn.Module):
+    """卷积 + PixelShuffle(2x) + 细化卷积"""
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv_expand = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, padding=1)
+        self.ps = nn.PixelShuffle(2)
+        self.refine = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv_expand(x)
+        x = self.ps(x)
+        x = self.refine(x)
+        return x'''
+
+# --- Sharp upsampling: Conv -> PixelShuffle -> Conv ---
+class UpShuffle(nn.Module):
+    def __init__(self, in_ch, out_ch, scale=2):
+        super().__init__()
+        self.up = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch * (scale ** 2), 3, padding=1),
+            nn.PixelShuffle(scale),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        # ICNR init for first conv
+        icnr_init(self.up[0].weight, scale=scale)
+        if self.up[0].bias is not None:
+            nn.init.zeros_(self.up[0].bias)
+    def forward(self, x):
+        return self.up(x)
+
 
 
 class ContentEncoder(nn.Module):
@@ -238,47 +374,41 @@ class StyleEncoder(nn.Module):
 
 
 class InfraredDecoder(nn.Module):
-    """红外解码器G_ir：通过AdaIN注入红外风格 + 轻量U-Net跳连"""
+    """红外解码器G_ir：SPADE(结构) + PhysicsFiLM(环境) + Cross-Attention(跨谱)（双线性上采样，无深监督）"""
     
-    def __init__(self, content_channels: int = 256, style_dim: int = 256, out_channels: int = 3):
+    def __init__(self, content_channels: int = 256, style_dim: int = 256, out_channels: int = 3,
+                 env_dim: int = 5, num_tokens: int = 8, token_dim: int = 64):
         super().__init__()
         
-        # AdaIN层
-        self.adain1 = AdaptiveInstanceNorm2d(content_channels)
-        self.adain2 = AdaptiveInstanceNorm2d(content_channels // 2)
-        self.adain3 = AdaptiveInstanceNorm2d(content_channels // 4)
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+        self.style_to_tokens = nn.Linear(style_dim, num_tokens * token_dim)
         
-        # 风格转换
-        self.style_transform1 = nn.Linear(style_dim, content_channels * 2)
-        self.style_transform2 = nn.Linear(style_dim, (content_channels // 2) * 2)
-        self.style_transform3 = nn.Linear(style_dim, (content_channels // 4) * 2)
-        
-        # 初始化为恒等调制：gamma≈0, beta≈0，防止早期塌缩
-        for m in [self.style_transform1, self.style_transform2, self.style_transform3]:
-            nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
-        
-        # 解码器（先卷积改变通道数，再上采样），配合两次跳连后的通道压缩
-        self.dec1 = nn.Sequential(  # 256 -> 128, upsample到1/4，并与c2拼接
+        # 双线性上采样路径（更稳定，PSNR 友好）
+        self.dec1 = nn.Sequential(
             nn.Conv2d(content_channels, content_channels // 2, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
-        self.skip_reduce1 = nn.Sequential(  # (128 + 128) -> 128
+        self.skip_reduce1 = nn.Sequential(
             nn.Conv2d(content_channels // 2 + content_channels // 2, content_channels // 2, 3, padding=1),
             nn.ReLU(inplace=True)
         )
-        # 细化高频（提升容量）
         self.refine1 = nn.Sequential(
             ResidualBlock(content_channels // 2),
             nn.Conv2d(content_channels // 2, content_channels // 2, 3, padding=1),
             nn.ReLU(inplace=True)
         )
-        self.dec2 = nn.Sequential(  # 128 -> 64, upsample到1/2，并与c1拼接
+        self.spade1 = SPADE(content_channels // 2, content_channels // 2)
+        self.film1 = PhysicsFiLM(content_channels // 2, env_dim)
+        self.attn1 = CrossAttention2D(content_channels // 2, token_dim, num_tokens)
+        
+        self.dec2 = nn.Sequential(
             nn.Conv2d(content_channels // 2, content_channels // 4, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
-        self.skip_reduce2 = nn.Sequential(  # (64 + 64) -> 64
+        self.skip_reduce2 = nn.Sequential(
             nn.Conv2d(content_channels // 4 + content_channels // 4, content_channels // 4, 3, padding=1),
             nn.ReLU(inplace=True)
         )
@@ -287,7 +417,11 @@ class InfraredDecoder(nn.Module):
             nn.Conv2d(content_channels // 4, content_channels // 4, 3, padding=1),
             nn.ReLU(inplace=True)
         )
-        self.dec3 = nn.Sequential(  # 64 -> 64, upsample到1
+        self.spade2 = SPADE(content_channels // 4, content_channels // 4)
+        self.film2 = PhysicsFiLM(content_channels // 4, env_dim)
+        self.attn2 = CrossAttention2D(content_channels // 4, token_dim, num_tokens)
+        
+        self.dec3 = nn.Sequential(
             nn.Conv2d(content_channels // 4, content_channels // 4, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -297,44 +431,45 @@ class InfraredDecoder(nn.Module):
             nn.Conv2d(content_channels // 4, content_channels // 4, 3, padding=1),
             nn.ReLU(inplace=True)
         )
-        self.out_conv = nn.Sequential(  # 64 -> 3
+        self.spade3 = SPADE(content_channels // 4, content_channels // 4)
+        self.film3 = PhysicsFiLM(content_channels // 4, env_dim)
+        self.attn3 = CrossAttention2D(content_channels // 4, token_dim, num_tokens)
+        self.out_conv = nn.Sequential(
             nn.Conv2d(content_channels // 4, out_channels, 7, padding=3),
             nn.Sigmoid()
         )
     
-    def forward(self, content_skips, style):
-        """
-        Args:
-            content_skips: (c1, c2, c3) 跳连特征
-            style: 风格向量 [B, style_dim]
-        """
+    def forward(self, content_skips, style, env: torch.Tensor = None):
         c1, c2, c3 = content_skips
-
-        # 第一层：AdaIN(256) -> Conv+Up(256->128) + 跳连c2
-        style_params1 = self.style_transform1(style)
-        x = self.adain1(c3, style_params1)
-        x = self.dec1(x)
+        tokens = self.style_to_tokens(style).view(style.size(0), self.num_tokens, self.token_dim)
+        
+        x = self.dec1(c3)
         x = torch.cat([x, c2], dim=1)
-        x = self.skip_reduce1(x)  # 回到128通道
+        x = self.skip_reduce1(x)
         x = self.refine1(x)
-
-        # 第二层：AdaIN(128) -> Conv+Up(128->64) + 跳连c1
-        style_params2 = self.style_transform2(style)
-        x = self.adain2(x, style_params2)
+        x = self.spade1(x, c2)
+        if env is not None:
+            x = self.film1(x, env)
+        x = self.attn1(x, tokens)
+        
         x = self.dec2(x)
         x = torch.cat([x, c1], dim=1)
-        x = self.skip_reduce2(x)  # 回到64通道
+        x = self.skip_reduce2(x)
         x = self.refine2(x)
-
-        # 第三层：AdaIN(64) -> Conv+Up(64->64)
-        style_params3 = self.style_transform3(style)
-        x = self.adain3(x, style_params3)
+        x = self.spade2(x, c1)
+        if env is not None:
+            x = self.film2(x, env)
+        x = self.attn2(x, tokens)
+        
         x = self.dec3(x)
         x = self.refine3(x)
-
-        # 输出层
-        x = self.out_conv(x)
+        cond3 = F.interpolate(c1, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.spade3(x, cond3)
+        if env is not None:
+            x = self.film3(x, env)
+        x = self.attn3(x, tokens)
         
+        x = self.out_conv(x)
         return x
 
 
@@ -346,10 +481,10 @@ class DomainDiscriminator(nn.Module):
         
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim, 256),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Dropout(0.5),
             nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Dropout(0.5),
             nn.Linear(128, 2)  # 可见光域 vs 红外域
         )
@@ -406,7 +541,7 @@ class CrossModalGenerationModel(nn.Module):
             feature_dim=config.get('base_channels', 64) * 4
         )
     
-    def forward(self, visible, infrared=None, alpha=1.0):
+    def forward(self, visible, infrared=None, alpha=1.0, env: Optional[torch.Tensor] = None):
         """
         Args:
             visible: 可见光图像 [B, 3, H, W]
@@ -446,12 +581,13 @@ class CrossModalGenerationModel(nn.Module):
             outputs['domain_pred_v'] = self.domain_discriminator(content_v_reversed)
             outputs['domain_pred_ir'] = self.domain_discriminator(content_ir_reversed)
             
-            # 生成红外图像：使用可见光内容 + 真实红外风格
-            generated_ir = self.infrared_decoder((c1_v, c2_v, c3_v), style_ir)
+            # 生成红外图像：使用可见光内容 + 真实红外风格 + 物理先验
+            generated_ir = self.infrared_decoder((c1_v, c2_v, c3_v), style_ir, env=env)
         else:
             # 推理模式：仅从可见光生成（使用可见光风格作为近似）
-            generated_ir = self.infrared_decoder((c1_v, c2_v, c3_v), style_v)
+            generated_ir = self.infrared_decoder((c1_v, c2_v, c3_v), style_v, env=env)
         
+        # 统一在此处写入生成结果
         outputs['generated_ir'] = generated_ir
         
         return outputs
@@ -462,34 +598,51 @@ class CrossModalGenerationModel(nn.Module):
 # ===========================
 
 class MS_SSIM_Loss(nn.Module):
-    """多尺度结构相似性损失"""
-    
+    """多尺度结构相似性损失（简化实现）"""
     def __init__(self, channels: int = 3):
         super().__init__()
         self.channels = channels
-    
     def forward(self, pred, target):
-        # 简化版本：使用SSIM的核心思想
-        # 完整实现建议使用pytorch-msssim库
-        
         mu_pred = F.avg_pool2d(pred, 3, 1, 1)
         mu_target = F.avg_pool2d(target, 3, 1, 1)
-        
         mu_pred_sq = mu_pred.pow(2)
         mu_target_sq = mu_target.pow(2)
         mu_pred_target = mu_pred * mu_target
-        
         sigma_pred_sq = F.avg_pool2d(pred * pred, 3, 1, 1) - mu_pred_sq
         sigma_target_sq = F.avg_pool2d(target * target, 3, 1, 1) - mu_target_sq
         sigma_pred_target = F.avg_pool2d(pred * target, 3, 1, 1) - mu_pred_target
-        
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
-        
         ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / \
                    ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
-        
         return 1 - ssim_map.mean()
+
+
+class CharbonnierLoss(nn.Module):
+    """Charbonnier L1（更平滑的L1，利于细节与稳健性）"""
+    def __init__(self, eps: float = 1e-3):
+        super().__init__()
+        self.eps = eps
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.mean(torch.sqrt((pred - target) ** 2 + self.eps ** 2))
+
+
+class FrequencyLoss(nn.Module):
+    """频域幅值差异（强调中高频，缓解模糊）"""
+    def __init__(self):
+        super().__init__()
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # 转灰度以降低维度影响
+        if x.size(1) == 3:
+            xg = 0.2989 * x[:,0:1] + 0.5870 * x[:,1:2] + 0.1140 * x[:,2:3]
+            yg = 0.2989 * y[:,0:1] + 0.5870 * y[:,1:2] + 0.1140 * y[:,2:3]
+        else:
+            xg, yg = x, y
+        X = torch.fft.rfft2(xg, norm='ortho')
+        Y = torch.fft.rfft2(yg, norm='ortho')
+        Ax = torch.log1p(torch.abs(X))
+        Ay = torch.log1p(torch.abs(Y))
+        return torch.mean(torch.abs(Ax - Ay))
 
 
 class TotalVariationLoss(nn.Module):
@@ -685,12 +838,15 @@ class Trainer:
         
         # 损失函数
         self.l1_loss = nn.L1Loss()
+        self.charb_loss = CharbonnierLoss()
         self.l2_loss = nn.MSELoss()
         self.ms_ssim_loss = MS_SSIM_Loss()
         self.tv_loss = TotalVariationLoss()
         self.perceptual_loss = PerceptualLoss(device=device)
         self.grad_loss = SobelGradLoss().to(self.device)
         self.lap_loss = LaplacianLoss()
+        self.charb_loss = CharbonnierLoss(eps=1e-3)
+        self.freq_loss = FrequencyLoss()
         self.infonce_loss = InfoNCE_Loss(temperature=config.get('nce_temp', 0.07))
         self.ce_loss = nn.CrossEntropyLoss()
         
@@ -702,17 +858,54 @@ class Trainer:
             self.optimizer_d, T_max=config.get('epochs', 100)
         )
     
+    @staticmethod
+    def _metadata_to_tensor(metadata_batch, device):
+        """
+        将批量metadata(list[dict]或dict of lists)转为 [B, E] 张量。
+        顺序: distance, humidity, temperature, weather, windspeed
+        简单缩放到大致[0,1]范围。
+        """
+        # 兼容DataLoader的默认collate：通常是list[dict]
+        if isinstance(metadata_batch, list):
+            distances = [m.get('distance', 0.0) for m in metadata_batch]
+            humidities = [m.get('humidity', 0.0) for m in metadata_batch]
+            temperatures = [m.get('temperature', 0.0) for m in metadata_batch]
+            weathers = [m.get('weather', 0.0) for m in metadata_batch]
+            winds = [m.get('windspeed', 0.0) for m in metadata_batch]
+        elif isinstance(metadata_batch, dict):
+            distances = metadata_batch.get('distance', [])
+            humidities = metadata_batch.get('humidity', [])
+            temperatures = metadata_batch.get('temperature', [])
+            weathers = metadata_batch.get('weather', [])
+            winds = metadata_batch.get('windspeed', [])
+        else:
+            # 不可识别，退化为全零
+            b = metadata_batch.size(0) if hasattr(metadata_batch, 'size') else 1
+            return torch.zeros(b, 5, device=device, dtype=torch.float32)
+        
+        import numpy as np
+        def to_tensor(xs, scale):
+            arr = np.array(xs, dtype=np.float32) / scale
+            return torch.from_numpy(arr)
+        
+        d = to_tensor(distances, 100.0)
+        h = to_tensor(humidities, 100.0)
+        t = to_tensor(temperatures, 50.0)
+        w = to_tensor(weathers, 10.0) if len(weathers) else torch.zeros_like(d)
+        s = to_tensor(winds, 30.0) if len(winds) else torch.zeros_like(d)
+        env = torch.stack([d, h, t, w, s], dim=1).to(device)
+        return env
+    
     def compute_phase_a_loss(self, outputs, targets):
         """Phase A: 掩膜加权重构损失 + 感知损失"""
         generated_ir = outputs['generated_ir']
         target_ir = targets['infrared']
         
-        # L1/L2损失
-        l1 = self.l1_loss(generated_ir, target_ir)
+        # 主像素项：Charbonnier + L2（1:1 起步，由 lambda_l1 / lambda_l2 控制）
+        '''charb = self.charb_loss(generated_ir, target_ir)
         l2 = self.l2_loss(generated_ir, target_ir)
-        
-        # MS-SSIM损失
         ms_ssim = self.ms_ssim_loss(generated_ir, target_ir)
+
         
         # TV正则化
         tv = self.tv_loss(generated_ir)
@@ -730,20 +923,24 @@ class Trainer:
         grad = self.grad_loss(generated_ir, target_ir)
         # 高频一致性（Laplacian）
         lap = self.lap_loss(generated_ir, target_ir)
+        # 频域一致性（小权重）
+        freq = self.freq_loss(generated_ir, target_ir)
         # 边缘加权像素一致
         ewl1 = edge_weighted_l1(generated_ir, target_ir, beta=1.5)
 
         # 感知项的数值通常在 8-12 左右，为避免主导总损失，这里做固定缩放
         perceptual_scaled = 0.05 * perceptual
         # 总损失（量纲更平衡）
-        loss = (self.config.get('lambda_l1', 1.0) * l1 +
+        l1 = charb
+        loss = (self.config.get('lambda_l1', 1.0) * charb +
                 self.config.get('lambda_l2', 1.0) * l2 +
-                self.config.get('lambda_ssim', 1.0) * ms_ssim +
-                self.config.get('lambda_tv', 0.1) * tv +
-                self.config.get('lambda_perceptual', 1.0) * perceptual_scaled +
+                self.config.get('lambda_ssim', 0.2) * ms_ssim +
+                self.config.get('lambda_tv', 0.01) * tv +
+                self.config.get('lambda_perceptual', 0.5) * perceptual_scaled +
                 self.config.get('lambda_grad', 1.0) * grad +
-                self.config.get('lambda_lap', 0.5) * lap +
-                self.config.get('lambda_edge', 0.5) * ewl1)
+                self.config.get('lambda_lap', 0.4) * lap +
+                self.config.get('lambda_fft', 0.05) * freq +
+                self.config.get('lambda_edge', 0.3) * ewl1)
         
         return loss, {
             'l1': l1.item(), 
@@ -753,10 +950,66 @@ class Trainer:
             'perceptual': perceptual.item(),
             'grad': grad.item(),
             'lap': lap.item(),
+            'freq': freq.item(),
+            'ewl1': ewl1.item()
+        }'''
+
+        # 主像素项：Charbonnier + L2
+        charb = self.charb_loss(generated_ir, target_ir)
+        l2 = self.l2_loss(generated_ir, target_ir)
+        ms_ssim = self.ms_ssim_loss(generated_ir, target_ir)
+
+        # TV正则化
+        tv = self.tv_loss(generated_ir)
+        
+        # 感知损失（VGG特征）；当权重为0时跳过计算以节省开销
+        if self.config.get('lambda_perceptual', 0.0) > 0:
+            perceptual = self.perceptual_loss(
+                generated_ir if generated_ir.size(1)==3 else generated_ir.repeat(1,3,1,1),
+                target_ir if target_ir.size(1)==3 else target_ir.repeat(1,3,1,1)
+            )
+        else:
+            perceptual = torch.tensor(0.0, device=generated_ir.device)
+        
+        # 梯度/高频/边缘项：当作轻量正则，不再主导
+        grad = self.grad_loss(generated_ir, target_ir)
+        lap = self.lap_loss(generated_ir, target_ir)
+        freq = self.freq_loss(generated_ir, target_ir)
+        ewl1 = edge_weighted_l1(generated_ir, target_ir, beta=1.5)
+
+        # 感知项缩放，避免直接把总 loss 顶爆
+        perceptual_scaled = 0.05 * perceptual
+
+        # 总损失：L2 为核心，Charbonnier 可选
+        loss = (
+            self.config.get('lambda_l2', 2.0) * l2 +
+            self.config.get('lambda_l1', 0.0) * charb +
+            self.config.get('lambda_ssim', 0.4) * ms_ssim +
+            self.config.get('lambda_tv', 0.01) * tv +
+            self.config.get('lambda_perceptual', 0.0) * perceptual_scaled +
+            self.config.get('lambda_grad', 0.5) * grad +
+            self.config.get('lambda_lap', 0.3) * lap +
+            self.config.get('lambda_fft', 0.0) * freq +
+            self.config.get('lambda_edge', 0.3) * ewl1
+        )
+
+        # 这里的 l1 只是用来在日志里看 Charbonnier 数值
+        l1 = charb
+        return loss, {
+            'l1': l1.item(), 
+            'l2': l2.item(), 
+            'ms_ssim': ms_ssim.item(), 
+            'tv': tv.item(),
+            'perceptual': perceptual.item(),
+            'grad': grad.item(),
+            'lap': lap.item(),
+            'freq': freq.item(),
             'ewl1': ewl1.item()
         }
+
+        
     
-    def compute_phase_b_loss(self, outputs, targets, alpha):
+    def compute_phase_b_loss(self, outputs, targets, alpha, warmup_factor: float = 1.0):
         """Phase B: 重构 + 对齐"""
         # Phase A损失
         recon_loss, recon_metrics = self.compute_phase_a_loss(outputs, targets)
@@ -766,9 +1019,17 @@ class Trainer:
         content_ir = outputs['content_ir']
         nce_loss = self.infonce_loss(content_v, content_ir)
         
-        # 域对抗损失（让判别器无法区分内容来自哪个域）
-        domain_pred_v = outputs['domain_pred_v']
-        domain_pred_ir = outputs['domain_pred_ir']
+        # 域对抗损失（生成器步：重新前向且冻结判别器参数，防止参数版本冲突）
+        content_v_rev = GradientReversalLayer.apply(content_v, alpha)
+        content_ir_rev = GradientReversalLayer.apply(content_ir, alpha)
+        requires = []
+        for p in self.model.domain_discriminator.parameters():
+            requires.append(p.requires_grad)
+            p.requires_grad = False
+        domain_pred_v = self.model.domain_discriminator(content_v_rev)
+        domain_pred_ir = self.model.domain_discriminator(content_ir_rev)
+        for p, req in zip(self.model.domain_discriminator.parameters(), requires):
+            p.requires_grad = req
         
         batch_size = content_v.size(0)
         domain_labels_v = torch.zeros(batch_size, dtype=torch.long).to(self.device)
@@ -784,10 +1045,17 @@ class Trainer:
         mmd_loss = compute_mmd_loss(content_v_pooled, content_ir_pooled)
         
         # 总损失
-        loss = (recon_loss +
-                self.config.get('lambda_nce', 0.1) * nce_loss +
-                self.config.get('lambda_domain', 0.1) * domain_loss_g +
-                self.config.get('lambda_mmd', 0.01) * mmd_loss)
+        '''loss = (recon_loss +
+                warmup_factor * self.config.get('lambda_nce', 0.1) * nce_loss +
+                warmup_factor * self.config.get('lambda_domain', 0.1) * domain_loss_g +
+                warmup_factor * self.config.get('lambda_mmd', 0.01) * mmd_loss)'''
+
+        recon_weight_b = self.config.get('lambda_recon_b', 2.0)
+        loss = (recon_weight_b * recon_loss +
+                warmup_factor * self.config.get('lambda_nce', 0.02) * nce_loss +
+                warmup_factor * self.config.get('lambda_domain', 0.02) * domain_loss_g +
+                warmup_factor * self.config.get('lambda_mmd', 0.005) * mmd_loss)
+
         
         metrics = {
             **recon_metrics,
@@ -800,10 +1068,13 @@ class Trainer:
     
     def train_discriminator(self, outputs):
         """训练域判别器"""
-        domain_pred_v = outputs['domain_pred_v']
-        domain_pred_ir = outputs['domain_pred_ir']
+        # 使用未经过GRL的内容特征，并与生成器图断开，避免干扰
+        content_v = outputs['content_v'].detach()
+        content_ir = outputs['content_ir'].detach()
+        domain_pred_v = self.model.domain_discriminator(content_v)
+        domain_pred_ir = self.model.domain_discriminator(content_ir)
         
-        batch_size = domain_pred_v.size(0)
+        batch_size = content_v.size(0)
         domain_labels_v = torch.zeros(batch_size, dtype=torch.long).to(self.device)
         domain_labels_ir = torch.ones(batch_size, dtype=torch.long).to(self.device)
         
@@ -812,7 +1083,7 @@ class Trainer:
                  self.ce_loss(domain_pred_ir, domain_labels_ir)) / 2
         
         self.optimizer_d.zero_grad()
-        loss_d.backward(retain_graph=True)
+        loss_d.backward()
         self.optimizer_d.step()
         
         return loss_d.item()
@@ -829,18 +1100,21 @@ class Trainer:
         for batch_idx, batch in enumerate(progress_bar):
             visible = batch['visible'].to(self.device)
             infrared = batch['infrared'].to(self.device)
+            env = self._metadata_to_tensor(batch.get('metadata', []), self.device)
             
             # 计算GRL的alpha（逐渐增大）
             p = (epoch + batch_idx / len(dataloader)) / self.config.get('epochs', 100)
             alpha = 2. / (1. + np.exp(-10 * p)) - 1
+            self.progress = p
             
             # 前向传播
-            outputs = self.model(visible, infrared, alpha=alpha)
+            outputs = self.model(visible, infrared, alpha=alpha, env=env)
             
             # 准备已移到device的batch
             batch_gpu = {
                 'visible': visible,
                 'infrared': infrared,
+                'env': env,
                 'label': batch['label'].to(self.device) if 'label' in batch else None
             }
             
@@ -854,7 +1128,12 @@ class Trainer:
                     metrics = {'d_loss': d_loss}
                 
                 # 再训练生成器
-                loss, metrics = self.compute_phase_b_loss(outputs, batch_gpu, alpha)
+                # 线性 warmup: 在前 warmup_pct * epochs 内从 0 → 1
+                warmup_pct = float(self.config.get('phase_b_warmup', 0.2))
+                epochs_b = max(1, int(self.config.get('epochs_phase_b', 1)))
+                progress_b = (epoch - 1 + batch_idx / max(1, len(dataloader))) / epochs_b
+                warmup_factor = 1.0 if warmup_pct <= 0 else min(1.0, progress_b / warmup_pct)
+                loss, metrics = self.compute_phase_b_loss(outputs, batch_gpu, alpha, warmup_factor=warmup_factor)
             
             # 反向传播
             self.optimizer_g.zero_grad()
@@ -899,14 +1178,16 @@ class Trainer:
             for batch in tqdm(dataloader, desc='评估中'):
                 visible = batch['visible'].to(self.device)
                 infrared = batch['infrared'].to(self.device)
+                env = self._metadata_to_tensor(batch.get('metadata', []), self.device)
                 
                 # 前向传播
-                outputs = self.model(visible, infrared, alpha=1.0)
+                outputs = self.model(visible, infrared, alpha=1.0, env=env)
                 
                 # 准备batch
                 batch_gpu = {
                     'visible': visible,
                     'infrared': infrared,
+                    'env': env,
                 }
                 
                 # 计算损失
@@ -923,9 +1204,9 @@ class Trainer:
                 generated_ir = outputs['generated_ir']
                 target_ir = batch_gpu['infrared']
                 
-                # 转为numpy计算PSNR/SSIM
-                gen_np = generated_ir.cpu().numpy()
-                tgt_np = target_ir.cpu().numpy()
+                # 转为numpy计算PSNR/SSIM（评估前clamp到[0,1]）
+                gen_np = torch.clamp(generated_ir, 0, 1).cpu().numpy()
+                tgt_np = torch.clamp(target_ir, 0, 1).cpu().numpy()
                 
                 for i in range(gen_np.shape[0]):
                     # PSNR
@@ -978,6 +1259,8 @@ class Trainer:
 
 def main():
     parser = argparse.ArgumentParser(description='创新点2 - 跨模态生成与残差检测')
+    parser.add_argument('--resume', type=str, default='/mnt/e/code/project/inno2/checkpoints/phase_a_best.pth',help='path to a phase A checkpoint to resume generator weights from')
+
     
     # 数据参数
     parser.add_argument('--csv_path', type=str, default='/mnt/e/code/project/inno2/inno2.csv')
@@ -997,17 +1280,41 @@ def main():
     parser.add_argument('--lr_d', type=float, default=1e-4)
     
     # 损失权重
-    parser.add_argument('--lambda_l1', type=float, default=1.0)
+    '''parser.add_argument('--lambda_l1', type=float, default=1.0)
     parser.add_argument('--lambda_l2', type=float, default=1.0)
-    parser.add_argument('--lambda_ssim', type=float, default=1.0)
-    parser.add_argument('--lambda_tv', type=float, default=0.1)
-    parser.add_argument('--lambda_perceptual', type=float, default=1.0)
-    parser.add_argument('--lambda_lap', type=float, default=0.5)
-    parser.add_argument('--lambda_edge', type=float, default=0.5)
-    parser.add_argument('--lambda_grad', type=float, default=2.0)
+    parser.add_argument('--lambda_ssim', type=float, default=0.2)
+    parser.add_argument('--lambda_tv', type=float, default=0.01)
+    parser.add_argument('--lambda_perceptual', type=float, default=0.5)
+    parser.add_argument('--lambda_lap', type=float, default=0.4)
+    parser.add_argument('--lambda_edge', type=float, default=0.3)
+    parser.add_argument('--lambda_grad', type=float, default=1.0)
     parser.add_argument('--lambda_nce', type=float, default=0.1)
     parser.add_argument('--lambda_domain', type=float, default=0.1)
     parser.add_argument('--lambda_mmd', type=float, default=0.01)
+    parser.add_argument('--lambda_fft', type=float, default=0.05)
+    parser.add_argument('--lambda_charb', type=float, default=0.0)'''
+
+    # 损失权重（已调成“PSNR 优先”的默认配置）
+    # Phase A 主要目标：减小 L2 (MSE) 以提升 PSNR，结构项只做轻度约束
+    parser.add_argument('--lambda_l1', type=float, default=0.0)   # 不再让 Charbonnier 主导
+    parser.add_argument('--lambda_l2', type=float, default=2.0)   # 提高 L2 权重，直推 PSNR
+    parser.add_argument('--lambda_ssim', type=float, default=0.4) # 适度保留结构
+    parser.add_argument('--lambda_tv', type=float, default=0.01)  # 轻度平滑
+    parser.add_argument('--lambda_perceptual', type=float, default=0.0)  # 先关闭感知损失，防止牺牲 PSNR
+    parser.add_argument('--lambda_lap', type=float, default=0.3)  # 高频/边缘做轻正则
+    parser.add_argument('--lambda_edge', type=float, default=0.3)
+    parser.add_argument('--lambda_grad', type=float, default=0.5)
+    parser.add_argument('--lambda_fft', type=float, default=0.0)  # 暂停频域损失（对 PSNR 不一定友好）
+    parser.add_argument('--lambda_charb', type=float, default=0.0)
+
+    # Phase B 对齐项默认关小，后面需要时再慢慢开
+    parser.add_argument('--lambda_nce', type=float, default=0.02)
+    parser.add_argument('--lambda_domain', type=float, default=0.02)
+    parser.add_argument('--lambda_mmd', type=float, default=0.005)
+
+    parser.add_argument('--lambda_recon_b', type=float, default=0.2,
+                    help='Phase B 权重线性热身占比，0.2表示前20%进度把权重从0→设定值')
+
     
     # 其他
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -1039,9 +1346,18 @@ def main():
     dataset = PairedVIRDataset(args.csv_path, transform=transform, normalize_ir=False)
     
     # 划分训练集和验证集
+    import random
+    # 固定随机种子，保证每次训练/验证划分一致
+    seed = 42
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    g = torch.Generator().manual_seed(seed)
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=g)
+
     
     train_loader = DataLoader(
         train_dataset,
@@ -1075,6 +1391,12 @@ def main():
     
     # 创建训练器
     trainer = Trainer(model, config, args.device)
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=args.device)
+        state = ckpt.get('model_state_dict', ckpt)
+        trainer.model.load_state_dict(state, strict=True)
+        print(f"Resumed generator weights from {args.resume} (epoch={ckpt.get('epoch')}, phase={ckpt.get('phase')})")
     
     # Phase A: 重构训练
     print("\n[3/3] 开始训练...")
@@ -1083,6 +1405,7 @@ def main():
     print("=" * 80)
     
     best_val_loss_a = float('inf')
+    best_psnr_a = -1e9
     
     for epoch in range(1, args.epochs_phase_a + 1):
         # 训练
@@ -1093,7 +1416,7 @@ def main():
             print(f"  {k}: {v:.4f}")
         
         # 验证评估（每5个epoch评估一次）
-        if epoch % 5 == 0 or epoch == args.epochs_phase_a:
+        if epoch % 1 == 0 or epoch == args.epochs_phase_a:
             print(f"\n  [验证评估 Epoch {epoch}]")
             val_loss, val_metrics, gen_samples, tgt_samples = trainer.evaluate(val_loader, phase='A')
             print(f"  Val Loss: {val_loss:.4f}")
@@ -1142,10 +1465,10 @@ def main():
                     print(f"    ✓ 已保存 {min(3, len(gen_samples))} 个样本到: {vis_dir}")
             
             # 检查是否是最佳模型
-            is_best = val_loss < best_val_loss_a
+            is_best = val_metrics.get('psnr', 0) > best_psnr_a
             if is_best:
-                best_val_loss_a = val_loss
-                print(f"  ✓ 新的最佳模型！(Val Loss: {val_loss:.4f})")
+                best_psnr_a = val_metrics.get('psnr', 0)
+                print(f"  ✓ 新的最佳模型！(best_psnr: {best_psnr_a:.4f} dB)")
             
             if args.use_wandb:
                 wandb.log({
@@ -1171,6 +1494,16 @@ def main():
         last_a_path = os.path.join(args.save_dir, 'phase_a_last.pth')
         trainer.save_checkpoint(args.epochs_phase_a, 'A', last_a_path)
         print(f"✓ Phase A 最后模型已保存: {last_a_path}")
+
+    # --- 在进入 Phase B 前，强制从 Phase A 的 best 恢复 ---
+    best_a_path = os.path.join(args.save_dir, 'phase_a_best.pth')
+    if os.path.isfile(best_a_path):
+        print(f"从 Phase A 最优模型恢复: {best_a_path}")
+        ckpt = torch.load(best_a_path, map_location=args.device)
+        trainer.model.load_state_dict(ckpt['model_state_dict'])
+    else:
+        print("警告：未找到 phase_a_best.pth，将从 Phase A 最后一轮权重继续")
+
     
     # Phase B: 特征对齐训练
     if args.epochs_phase_b > 0:
@@ -1179,7 +1512,8 @@ def main():
         print("=" * 80)
         
         best_val_loss_b = float('inf')
-        
+        best_psnr_b = -1e9
+
         for epoch in range(1, args.epochs_phase_b + 1):
             # 训练
             loss, metrics = trainer.train_epoch(train_loader, phase='B', epoch=epoch)
@@ -1189,18 +1523,19 @@ def main():
                 print(f"  {k}: {v:.4f}")
             
             # 验证评估（每5个epoch评估一次）
-            if epoch % 5 == 0 or epoch == args.epochs_phase_b:
+            if epoch % 1 == 0 or epoch == args.epochs_phase_b:
                 print(f"\n  [验证评估 Epoch {epoch}]")
                 val_loss, val_metrics, _, _ = trainer.evaluate(val_loader, phase='B')
                 print(f"  Val Loss: {val_loss:.4f}")
                 for k, v in val_metrics.items():
                     print(f"    {k}: {v:.4f}")
-                
                 # 检查是否是最佳模型
-                is_best = val_loss < best_val_loss_b
+                #is_best = val_loss < best_val_loss_b
+                is_best = val_metrics.get('psnr', 0) > best_psnr_b
                 if is_best:
-                    best_val_loss_b = val_loss
-                    print(f"  ✓ 新的最佳模型！(Val Loss: {val_loss:.4f})")
+                    #best_val_loss_b = val_loss
+                    best_psnr_b = val_metrics.get('psnr', 0)
+                    print(f"  ✓ 新的最佳模型！(best_psnr: {best_psnr_b:.4f} dB)")
                 
                 if args.use_wandb:
                     wandb.log({

@@ -163,6 +163,10 @@ class InferenceEngine:
         img = tensor.cpu().numpy().transpose(1, 2, 0)
         img = np.clip(img, 0, 1)
         img = (img * 255).astype(np.uint8)
+
+        # 处理单通道情况，避免 PIL 无法识别 (H, W, 1) 形状
+        if img.ndim == 3 and img.shape[2] == 1:
+            img = img.squeeze(2)
         
         return img
     
@@ -212,6 +216,13 @@ class InferenceEngine:
         
         # 创建热力图
         heatmap = self.create_heatmap(residual)
+        # 调整热力图尺寸以匹配原始红外图像，确保叠加时尺寸一致
+        if heatmap.shape[:2] != infrared_img.shape[:2]:
+            heatmap = cv2.resize(
+                heatmap,
+                (infrared_img.shape[1], infrared_img.shape[0]),
+                interpolation=cv2.INTER_LINEAR
+            )
         
         # 创建可视化
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
