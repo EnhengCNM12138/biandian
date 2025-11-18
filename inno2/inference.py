@@ -20,8 +20,14 @@ import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torchvision import transforms
-
 from train_model import CrossModalGenerationModel
+import matplotlib.pyplot as plt
+
+
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei']
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['axes.unicode_minus'] = False
+
 
 
 class InferenceEngine:
@@ -229,26 +235,26 @@ class InferenceEngine:
         
         # 第一行
         axes[0, 0].imshow(visible_img)
-        axes[0, 0].set_title('可见光图像 (输入)', fontsize=12, fontproperties='SimHei')
+        axes[0, 0].set_title('可见光图像 (输入)', fontsize=12)
         axes[0, 0].axis('off')
         
         axes[0, 1].imshow(infrared_img)
-        axes[0, 1].set_title('真实红外图像', fontsize=12, fontproperties='SimHei')
+        axes[0, 1].set_title('真实红外图像', fontsize=12)
         axes[0, 1].axis('off')
         
         axes[0, 2].imshow(generated_ir_img)
-        axes[0, 2].set_title('生成红外图像', fontsize=12, fontproperties='SimHei')
+        axes[0, 2].set_title('生成红外图像', fontsize=12)
         axes[0, 2].axis('off')
         
         # 第二行
         axes[1, 0].imshow(heatmap)
-        axes[1, 0].set_title('残差热力图', fontsize=12, fontproperties='SimHei')
+        axes[1, 0].set_title('残差热力图', fontsize=12)
         axes[1, 0].axis('off')
         
         # 残差叠加在真实红外上
         overlay = cv2.addWeighted(infrared_img, 0.6, heatmap, 0.4, 0)
         axes[1, 1].imshow(overlay)
-        axes[1, 1].set_title('残差叠加', fontsize=12, fontproperties='SimHei')
+        axes[1, 1].set_title('残差叠加', fontsize=12)
         axes[1, 1].axis('off')
         
         # 异常分数显示
@@ -262,10 +268,10 @@ class InferenceEngine:
         # 判断是否异常（简单阈值）
         threshold = 0.1  # 可调整
         is_anomaly = scores['weighted'] > threshold
-        status = "⚠️ 异常" if is_anomaly else "✓ 正常"
+        status = "异常" if is_anomaly else "正常"
         score_text += f"\n状态: {status}"
         
-        axes[1, 2].text(0.1, 0.5, score_text, fontsize=14, family='monospace',
+        axes[1, 2].text(0.1, 0.5, score_text, fontsize=14,
                        verticalalignment='center',
                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         

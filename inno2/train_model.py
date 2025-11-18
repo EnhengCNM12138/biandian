@@ -1009,7 +1009,7 @@ class Trainer:
 
         
     
-    def compute_phase_b_loss(self, outputs, targets, alpha, warmup_factor: float = 1.0):
+    '''def compute_phase_b_loss(self, outputs, targets, alpha, warmup_factor: float = 1.0):
         """Phase B: 重构 + 对齐"""
         # Phase A损失
         recon_loss, recon_metrics = self.compute_phase_a_loss(outputs, targets)
@@ -1045,10 +1045,10 @@ class Trainer:
         mmd_loss = compute_mmd_loss(content_v_pooled, content_ir_pooled)
         
         # 总损失
-        '''loss = (recon_loss +
-                warmup_factor * self.config.get('lambda_nce', 0.1) * nce_loss +
-                warmup_factor * self.config.get('lambda_domain', 0.1) * domain_loss_g +
-                warmup_factor * self.config.get('lambda_mmd', 0.01) * mmd_loss)'''
+        #loss = (recon_loss +
+                #warmup_factor * self.config.get('lambda_nce', 0.1) * nce_loss +
+                #warmup_factor * self.config.get('lambda_domain', 0.1) * domain_loss_g +
+                #warmup_factor * self.config.get('lambda_mmd', 0.01) * mmd_loss)
 
         recon_weight_b = self.config.get('lambda_recon_b', 2.0)
         loss = (recon_weight_b * recon_loss +
@@ -1064,7 +1064,93 @@ class Trainer:
             'mmd': mmd_loss.item()
         }
         
-        return loss, metrics
+        return loss, metrics'''
+
+    def compute_phase_b_loss(self, outputs, targets, alpha=None, warmup_factor: float = 1.0):
+        """
+        Phase B：细节增强重构阶段
+        - 不再做对比学习 / 域对抗 / MMD
+        - 只优化 generated_ir 与 target_ir 的差异，但更强调结构和高频
+        """
+        generated_ir = outputs['generated_ir']
+        target_ir = targets['infrared']
+
+        # 像素项：Charbonnier + L2 + MS-SSIM
+        '''charb = self.charb_loss(generated_ir, target_ir)
+        l2 = self.l2_loss(generated_ir, target_ir)
+        ms_ssim = self.ms_ssim_loss(generated_ir, target_ir)
+
+        # TV 正则
+        tv = self.tv_loss(generated_ir)
+
+        # 感知损失（可选，默认关）
+        if self.config.get('lambda_perceptual_b', 0.0) > 0:
+            perceptual = self.perceptual_loss(
+                generated_ir if generated_ir.size(1) == 3 else generated_ir.repeat(1, 3, 1, 1),
+                target_ir if target_ir.size(1) == 3 else target_ir.repeat(1, 3, 1, 1)
+            )
+        else:
+            perceptual = torch.tensor(0.0, device=generated_ir.device)
+
+        # 梯度 / 高频 / 边缘
+        grad = self.grad_loss(generated_ir, target_ir)
+        lap = self.lap_loss(generated_ir, target_ir)
+        freq = self.freq_loss(generated_ir, target_ir)
+        ewl1 = edge_weighted_l1(generated_ir, target_ir, beta=1.5)
+
+        # 感知项缩放，避免爆掉
+        perceptual_scaled = 0.05 * perceptual
+
+        # Phase B 专用权重（如果没单独给，就回退到 Phase A 的配置）
+        loss = (
+            # Charbonnier 不主导，主要看 L2 和结构
+            self.config.get('lambda_l1', 0.0) * charb +
+            self.config.get('lambda_l2_b', self.config.get('lambda_l2', 2.0)) * l2 +
+            self.config.get('lambda_ssim_b', self.config.get('lambda_ssim', 0.4)) * ms_ssim +
+            self.config.get('lambda_tv_b', self.config.get('lambda_tv', 0.01)) * tv +
+            self.config.get('lambda_perceptual_b', 0.0) * perceptual_scaled +
+            self.config.get('lambda_grad_b', self.config.get('lambda_grad', 0.5)) * grad +
+            self.config.get('lambda_lap_b', self.config.get('lambda_lap', 0.3)) * lap +
+            self.config.get('lambda_fft_b', self.config.get('lambda_fft', 0.0)) * freq +
+            self.config.get('lambda_edge_b', self.config.get('lambda_edge', 0.3)) * ewl1
+        )
+
+        return loss, {
+            'l1': charb.item(),
+            'l2': l2.item(),
+            'ms_ssim': ms_ssim.item(),
+            'tv': tv.item(),
+            'perceptual': perceptual.item(),
+            'grad': grad.item(),
+            'lap': lap.item(),
+            'freq': freq.item(),
+            'ewl1': ewl1.item(),
+        }'''
+
+        # ========= 只用 L2 做优化 =========
+        l2 = self.l2_loss(generated_ir, target_ir)
+
+        # 下面这些只是为了你在 log 里还能看到数值变化，不参与反向传播
+        charb = self.charb_loss(generated_ir, target_ir)
+        ms_ssim = self.ms_ssim_loss(generated_ir, target_ir)
+        tv = self.tv_loss(generated_ir)
+
+        # 纯 PSNR 模式：loss 就是 L2（乘一个权重）
+        loss = self.config.get('lambda_l2_b', 1.0) * l2
+
+        return loss, {
+            'l1': charb.item(),      # 这里的 l1 其实是 Charbonnier
+            'l2': l2.item(),
+            'ms_ssim': ms_ssim.item(),
+            'tv': tv.item(),
+            'perceptual': 0.0,
+            'grad': 0.0,
+            'lap': 0.0,
+            'freq': 0.0,
+            'ewl1': 0.0,
+        }
+
+
     
     def train_discriminator(self, outputs):
         """训练域判别器"""
@@ -1121,7 +1207,11 @@ class Trainer:
             # 计算损失
             if phase == 'A':
                 loss, metrics = self.compute_phase_a_loss(outputs, batch_gpu)
+
             elif phase == 'B':
+                loss, metrics = self.compute_phase_b_loss(outputs, batch_gpu)
+
+            '''elif phase == 'B':
                 # 先训练判别器
                 if batch_idx % self.config.get('d_steps', 1) == 0:
                     d_loss = self.train_discriminator(outputs)
@@ -1133,7 +1223,10 @@ class Trainer:
                 epochs_b = max(1, int(self.config.get('epochs_phase_b', 1)))
                 progress_b = (epoch - 1 + batch_idx / max(1, len(dataloader))) / epochs_b
                 warmup_factor = 1.0 if warmup_pct <= 0 else min(1.0, progress_b / warmup_pct)
-                loss, metrics = self.compute_phase_b_loss(outputs, batch_gpu, alpha, warmup_factor=warmup_factor)
+                loss, metrics = self.compute_phase_b_loss(outputs, batch_gpu, alpha, warmup_factor=warmup_factor)'''
+
+
+
             
             # 反向传播
             self.optimizer_g.zero_grad()
@@ -1312,8 +1405,18 @@ def main():
     parser.add_argument('--lambda_domain', type=float, default=0.02)
     parser.add_argument('--lambda_mmd', type=float, default=0.005)
 
-    parser.add_argument('--lambda_recon_b', type=float, default=0.2,
-                    help='Phase B 权重线性热身占比，0.2表示前20%进度把权重从0→设定值')
+    #parser.add_argument('--lambda_recon_b', type=float, default=0.2,
+                    #help='Phase B 权重线性热身占比，0.2表示前20%进度把权重从0→设定值')
+
+    # Phase B 专用重构权重：更强调结构与高频
+    parser.add_argument('--lambda_l2_b', type=float, default=1.5)
+    parser.add_argument('--lambda_ssim_b', type=float, default=0.6)
+    parser.add_argument('--lambda_tv_b', type=float, default=0.005)
+    parser.add_argument('--lambda_perceptual_b', type=float, default=0.1)
+    parser.add_argument('--lambda_grad_b', type=float, default=1.0)
+    parser.add_argument('--lambda_lap_b', type=float, default=0.8)
+    parser.add_argument('--lambda_edge_b', type=float, default=0.8)
+    parser.add_argument('--lambda_fft_b', type=float, default=0.0)
 
     
     # 其他
@@ -1503,6 +1606,21 @@ def main():
         trainer.model.load_state_dict(ckpt['model_state_dict'])
     else:
         print("警告：未找到 phase_a_best.pth，将从 Phase A 最后一轮权重继续")
+
+
+    # ====== 关键改动：Phase B 只微调解码器和风格编码器，冻结内容编码器 ======
+    # 这样可以保持 Phase A 已经学好的“结构/几何”表示，只针对红外强度做 PSNR 微调
+    for p in trainer.model.content_encoder.parameters():
+        p.requires_grad = False
+    # 如果你想更激进一点，也可以把可见光风格编码器冻结，只调 IR 风格 + 解码器：
+    # for p in trainer.model.visible_style_encoder.parameters():
+    #     p.requires_grad = False
+    # 域判别器在我们简化后的 Phase B 里已经不用了，不需要管它
+
+    # 域判别器如果 Phase B 不再用 GAN，可以一并冻结
+    for p in trainer.model.domain_discriminator.parameters():
+        p.requires_grad = False
+
 
     
     # Phase B: 特征对齐训练

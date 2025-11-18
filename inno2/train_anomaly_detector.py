@@ -269,7 +269,7 @@ class TeacherStudentDetector:
 # 主训练流程
 # ===========================
 
-def extract_residuals(model, dataloader, device):
+def extract_residuals(model, dataloader, device, residual_size=32):
     """提取所有正常样本的残差"""
     model.eval()
     
@@ -289,7 +289,15 @@ def extract_residuals(model, dataloader, device):
             # 计算残差
             residual = torch.abs(infrared - generated_ir)
             
-            all_residuals.append(residual.cpu().numpy())
+            if residual_size is not None:
+                residual = F.interpolate(
+                    residual,
+                    size=(residual_size, residual_size),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            all_residuals.append(residual.cpu().numpy().astype(np.float32))
     
     # 合并
     all_residuals = np.concatenate(all_residuals, axis=0)
@@ -309,6 +317,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output_dir', type=str, default='/mnt/e/code/project/inno2/anomaly_models')
+    parser.add_argument('--residual_size', type=int, default=32,
+                        help='残差图下采样尺寸（边长），避免协方差矩阵过大')
     
     # Teacher-Student特定参数
     parser.add_argument('--student_epochs', type=int, default=20)
@@ -357,7 +367,7 @@ def main():
         print("\n使用高斯密度估计方法...")
         
         # 提取残差
-        residuals = extract_residuals(model, dataloader, args.device)
+        residuals = extract_residuals(model, dataloader, args.device, residual_size=args.residual_size)
         
         # 拟合高斯分布
         estimator = GaussianDensityEstimator()
