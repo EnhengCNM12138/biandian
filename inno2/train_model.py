@@ -203,6 +203,36 @@ class PhysicsFiLM(nn.Module):
         return x * (1 + gamma) + beta
 
 
+class EnvAttentionBlock(nn.Module):
+    """使用环境元数据对特征做一次简易 cross-attention。"""
+    def __init__(self, channels: int, env_dim: int, num_tokens: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.num_tokens = num_tokens
+        self.feat_q = nn.Conv2d(channels, channels, kernel_size=1)
+        self.env_k = nn.Linear(env_dim, channels * num_tokens)
+        self.env_v = nn.Linear(env_dim, channels * num_tokens)
+        self.env_gate = nn.Linear(env_dim, channels)
+        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
+    
+    def forward(self, x: torch.Tensor, env_vec: Optional[torch.Tensor]) -> torch.Tensor:
+        if env_vec is None:
+            return x
+        
+        b, c, h, w = x.shape
+        q = self.feat_q(x).view(b, c, h * w).transpose(1, 2)  # [B, HW, C]
+        k = self.env_k(env_vec).view(b, self.num_tokens, c)   # [B, T, C]
+        v = self.env_v(env_vec).view(b, self.num_tokens, c)   # [B, T, C]
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (c ** 0.5)  # [B, HW, T]
+        weights = torch.softmax(attn, dim=-1)
+        context = torch.matmul(weights, v)  # [B, HW, C]
+        context = context.transpose(1, 2).view(b, c, h, w)
+        out = self.out_proj(context)
+        gate = torch.tanh(self.env_gate(env_vec)).view(b, c, 1, 1)
+        return x + gate * out
+
+
 class CrossAttention2D(nn.Module):
     """跨注意力：用style tokens调制空间特征。"""
     def __init__(self, channels: int, token_dim: int, num_tokens: int, num_heads: int = 4):
@@ -243,6 +273,25 @@ class CrossAttention2D(nn.Module):
 
 
 
+'''class ResidualBlock(nn.Module):
+    """残差块"""
+    
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.InstanceNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2 = nn.InstanceNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = self.relu(out)
+        return out'''
+
 class ResidualBlock(nn.Module):
     """残差块"""
     
@@ -261,6 +310,62 @@ class ResidualBlock(nn.Module):
         out += residual
         out = self.relu(out)
         return out
+
+class IRRefinerWithResiduals(nn.Module):
+    def __init__(self, base_ch=64):  # 增大基础通道数，默认64
+        super().__init__()
+
+        def conv_block(in_ch, out_ch):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+                nn.ReLU(inplace=True),
+            )
+
+        self.enc1 = conv_block(2, base_ch)
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.enc2 = conv_block(base_ch, base_ch * 2)
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.bottleneck = conv_block(base_ch * 2, base_ch * 4)
+
+        self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.dec2 = conv_block(base_ch * 4, base_ch * 2)
+
+        self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            conv_block(base_ch * 2, base_ch),
+            nn.Conv2d(base_ch, 1, 3, padding=1)
+        )
+        
+        # 添加残差模块
+        self.residual_block = ResidualBlock(base_ch)
+
+    def forward(self, coarse_ir, vis_gray):
+        x = torch.cat([coarse_ir, vis_gray], dim=1)
+
+        e1 = self.enc1(x)
+        p1 = self.pool1(e1)
+
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+
+        b = self.bottleneck(p2)
+
+        u2 = self.up2(b)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1))
+
+        u1 = self.up1(d2)
+        out = self.dec1(torch.cat([u1, e1], dim=1))
+
+        # 残差学习
+        refined = coarse_ir + 0.2 * out  # 残差学习
+        refined = self.residual_block(refined)  # 添加残差模块
+
+        return torch.clamp(refined, 0.0, 1.0)
+
 
 
 def icnr_init(conv_weight: torch.Tensor, scale: int = 2, init=nn.init.kaiming_normal_) -> None:
@@ -374,14 +479,15 @@ class StyleEncoder(nn.Module):
 
 
 class InfraredDecoder(nn.Module):
-    """红外解码器G_ir：SPADE(结构) + PhysicsFiLM(环境) + Cross-Attention(跨谱)（双线性上采样，无深监督）"""
+    """红外解码器G_ir：SPADE + (FiLM/Concat/Attention) + Cross-Attention"""
     
     def __init__(self, content_channels: int = 256, style_dim: int = 256, out_channels: int = 3,
-                 env_dim: int = 5, num_tokens: int = 8, token_dim: int = 64):
+                 env_dim: int = 5, num_tokens: int = 8, token_dim: int = 64, env_mode: str = 'film'):
         super().__init__()
         
         self.num_tokens = num_tokens
         self.token_dim = token_dim
+        self.env_mode = env_mode
         self.style_to_tokens = nn.Linear(style_dim, num_tokens * token_dim)
         
         # 双线性上采样路径（更稳定，PSNR 友好）
@@ -400,7 +506,6 @@ class InfraredDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.spade1 = SPADE(content_channels // 2, content_channels // 2)
-        self.film1 = PhysicsFiLM(content_channels // 2, env_dim)
         self.attn1 = CrossAttention2D(content_channels // 2, token_dim, num_tokens)
         
         self.dec2 = nn.Sequential(
@@ -418,7 +523,6 @@ class InfraredDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.spade2 = SPADE(content_channels // 4, content_channels // 4)
-        self.film2 = PhysicsFiLM(content_channels // 4, env_dim)
         self.attn2 = CrossAttention2D(content_channels // 4, token_dim, num_tokens)
         
         self.dec3 = nn.Sequential(
@@ -432,14 +536,47 @@ class InfraredDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.spade3 = SPADE(content_channels // 4, content_channels // 4)
-        self.film3 = PhysicsFiLM(content_channels // 4, env_dim)
         self.attn3 = CrossAttention2D(content_channels // 4, token_dim, num_tokens)
         self.out_conv = nn.Sequential(
             nn.Conv2d(content_channels // 4, out_channels, 7, padding=3),
             nn.Sigmoid()
         )
+        
+        # 环境融合组件
+        stage_channels = [content_channels // 2, content_channels // 4, content_channels // 4]
+        self.film_layers = nn.ModuleList([
+            PhysicsFiLM(stage_channels[0], env_dim),
+            PhysicsFiLM(stage_channels[1], env_dim),
+            PhysicsFiLM(stage_channels[2], env_dim)
+        ])
+        self.concat_mlps = nn.ModuleList([
+            nn.Sequential(nn.Linear(env_dim, ch), nn.ReLU(inplace=True))
+            for ch in stage_channels
+        ])
+        self.concat_convs = nn.ModuleList([
+            nn.Conv2d(ch * 2, ch, kernel_size=1)
+            for ch in stage_channels
+        ])
+        self.env_attn_blocks = nn.ModuleList([
+            EnvAttentionBlock(ch, env_dim)
+            for ch in stage_channels
+        ])
     
-    def forward(self, content_skips, style, env: torch.Tensor = None):
+    def _apply_env(self, x: torch.Tensor, env: Optional[torch.Tensor], stage_idx: int) -> torch.Tensor:
+        if env is None or self.env_mode == 'none':
+            return x
+        if self.env_mode == 'film':
+            return self.film_layers[stage_idx](x, env)
+        if self.env_mode == 'concat':
+            env_feat = self.concat_mlps[stage_idx](env).unsqueeze(-1).unsqueeze(-1)
+            env_feat = env_feat.expand(-1, -1, x.size(2), x.size(3))
+            fused = torch.cat([x, env_feat], dim=1)
+            return self.concat_convs[stage_idx](fused)
+        if self.env_mode == 'attn':
+            return self.env_attn_blocks[stage_idx](x, env)
+        raise ValueError(f"Unsupported env_mode: {self.env_mode}")
+    
+    def forward(self, content_skips, style, env: Optional[torch.Tensor] = None):
         c1, c2, c3 = content_skips
         tokens = self.style_to_tokens(style).view(style.size(0), self.num_tokens, self.token_dim)
         
@@ -448,8 +585,7 @@ class InfraredDecoder(nn.Module):
         x = self.skip_reduce1(x)
         x = self.refine1(x)
         x = self.spade1(x, c2)
-        if env is not None:
-            x = self.film1(x, env)
+        x = self._apply_env(x, env, stage_idx=0)
         x = self.attn1(x, tokens)
         
         x = self.dec2(x)
@@ -457,16 +593,14 @@ class InfraredDecoder(nn.Module):
         x = self.skip_reduce2(x)
         x = self.refine2(x)
         x = self.spade2(x, c1)
-        if env is not None:
-            x = self.film2(x, env)
+        x = self._apply_env(x, env, stage_idx=1)
         x = self.attn2(x, tokens)
         
         x = self.dec3(x)
         x = self.refine3(x)
         cond3 = F.interpolate(c1, scale_factor=2, mode='bilinear', align_corners=False)
         x = self.spade3(x, cond3)
-        if env is not None:
-            x = self.film3(x, env)
+        x = self._apply_env(x, env, stage_idx=2)
         x = self.attn3(x, tokens)
         
         x = self.out_conv(x)
@@ -504,10 +638,11 @@ class DomainDiscriminator(nn.Module):
 class CrossModalGenerationModel(nn.Module):
     """跨模态生成模型"""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, env_mode: str = 'film'):
         super().__init__()
         
         self.config = config
+        self.env_mode = env_mode
         # 与数据集中对可见光的标准化保持一致，用于IR在编码器前做域对齐
         self.register_buffer('imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('imagenet_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -533,7 +668,8 @@ class CrossModalGenerationModel(nn.Module):
         self.infrared_decoder = InfraredDecoder(
             content_channels=config.get('base_channels', 64) * 4,
             style_dim=config.get('style_dim', 256),
-            out_channels=1
+            out_channels=1,
+            env_mode=env_mode
         )
         
         # 域判别器
@@ -721,6 +857,58 @@ def edge_weighted_l1(pred: torch.Tensor, target: torch.Tensor, beta: float = 1.0
     return torch.mean(wt * torch.abs(pred - target))
 
 
+class IRRefiner(nn.Module):
+    def __init__(self, base_ch=64):  # 增大基础通道数，默认64
+        super().__init__()
+
+        def conv_block(in_ch, out_ch):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+                nn.ReLU(inplace=True),
+            )
+
+        # 增加更多的层数
+        self.enc1 = conv_block(2, base_ch)
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.enc2 = conv_block(base_ch, base_ch * 2)
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.bottleneck = conv_block(base_ch * 2, base_ch * 4)
+
+        self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.dec2 = conv_block(base_ch * 4, base_ch * 2)
+
+        self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            conv_block(base_ch * 2, base_ch),
+            nn.Conv2d(base_ch, 1, 3, padding=1)
+        )
+
+    def forward(self, coarse_ir, vis_gray):
+        x = torch.cat([coarse_ir, vis_gray], dim=1)   # [B,2,H,W]
+
+        e1 = self.enc1(x)
+        p1 = self.pool1(e1)
+
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+
+        b = self.bottleneck(p2)
+
+        u2 = self.up2(b)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1))
+
+        u1 = self.up1(d2)
+        out = self.dec1(torch.cat([u1, e1], dim=1))   # [B,1,H,W]
+
+        refined = coarse_ir + 0.2 * out  # 残差学习
+        return torch.clamp(refined, 0.0, 1.0)
+
+
+
 class PerceptualLoss(nn.Module):
     """感知损失（使用VGG特征）"""
     
@@ -819,6 +1007,8 @@ class Trainer:
         self.model = model.to(device)
         self.config = config
         self.device = device
+        self.env_mode = config.get('env_mode', 'film')
+        self.use_env = self.env_mode != 'none'
         
         # 优化器
         self.optimizer_g = torch.optim.Adam(
@@ -1128,7 +1318,7 @@ class Trainer:
         }'''
 
         # ========= 只用 L2 做优化 =========
-        l2 = self.l2_loss(generated_ir, target_ir)
+        '''l2 = self.l2_loss(generated_ir, target_ir)
 
         # 下面这些只是为了你在 log 里还能看到数值变化，不参与反向传播
         charb = self.charb_loss(generated_ir, target_ir)
@@ -1148,8 +1338,66 @@ class Trainer:
             'lap': 0.0,
             'freq': 0.0,
             'ewl1': 0.0,
-        }
+        }''' 
 
+        # Charbonnier：只拿来做日志，不直接进 loss（Phase A 已经用过）
+        charb   = self.charb_loss(generated_ir, target_ir)
+        l2      = self.l2_loss(generated_ir, target_ir)          # MSE，对应 PSNR
+        ms_ssim = self.ms_ssim_loss(generated_ir, target_ir)     # 1-SSIM，约束结构
+
+        # TV：轻微平滑，抑制小噪声，不要太大，否则热斑会被抹平
+        tv = self.tv_loss(generated_ir)
+
+        # ---- 边缘/高频项：直接对应热斑边缘 & 纹理 ----
+        grad = self.grad_loss(generated_ir, target_ir)           # Sobel 梯度一致性（边缘对齐）
+        lap  = self.lap_loss(generated_ir, target_ir)            # Laplacian 高频（纹理/细节）
+        freq = self.freq_loss(generated_ir, target_ir)           # 频域幅值差异（防止过度模糊）
+        ewl1 = edge_weighted_l1(generated_ir, target_ir, beta=1.5)  # 边缘加权 L1，强化热斑边界
+
+        # ---- 感知项：让整体观感更像目标 IR ----
+        if self.config.get('lambda_perceptual_b', 0.0) > 0:
+            # VGG 是 3 通道，这里把单通道 IR 复制三份
+            pred_rgb = generated_ir if generated_ir.size(1) == 3 else generated_ir.repeat(1, 3, 1, 1)
+            tgt_rgb  = target_ir    if target_ir.size(1) == 3 else target_ir.repeat(1, 3, 1, 1)
+            perceptual = self.perceptual_loss(pred_rgb, tgt_rgb)
+        else:
+            perceptual = torch.tensor(0.0, device=generated_ir.device)
+
+        # 感知项缩放，避免数值过大
+        perceptual_scaled = 0.05 * perceptual
+
+        # ---- Phase B 专用权重（结构/边缘优先）----
+        loss = (
+            # 1) L2：保留数值锚点，但不做绝对主角
+            self.config.get('lambda_l2_b', 2.0)   * l2 +
+
+            # 2) 结构项：让红外大结构/区域分布贴近 GT
+            self.config.get('lambda_ssim_b', 1.0) * ms_ssim +
+
+            # 3) 轻微平滑
+            self.config.get('lambda_tv_b', 0.002) * tv +
+
+            # 4) 边缘/高频：真正对热斑边缘、纹理起作用的部分
+            self.config.get('lambda_grad_b', 1.0) * grad +
+            self.config.get('lambda_lap_b', 1.0)  * lap +
+            self.config.get('lambda_edge_b', 1.0) * ewl1 +
+            self.config.get('lambda_fft_b', 0.2)  * freq +
+
+            # 5) 感知项：整体观感更像目标 IR（默认开一点点就够）
+            self.config.get('lambda_perceptual_b', 0.2) * perceptual_scaled
+        )
+
+        return loss, {
+            'l1': charb.item(),              # 这里 l1 = Charbonnier
+            'l2': l2.item(),
+            'ms_ssim': ms_ssim.item(),
+            'tv': tv.item(),
+            'perceptual': float(perceptual),
+            'grad': grad.item(),
+            'lap': lap.item(),
+            'freq': freq.item(),
+            'ewl1': ewl1.item(),
+        }
 
     
     def train_discriminator(self, outputs):
@@ -1186,7 +1434,7 @@ class Trainer:
         for batch_idx, batch in enumerate(progress_bar):
             visible = batch['visible'].to(self.device)
             infrared = batch['infrared'].to(self.device)
-            env = self._metadata_to_tensor(batch.get('metadata', []), self.device)
+            env = self._metadata_to_tensor(batch.get('metadata', []), self.device) if self.use_env else None
             
             # 计算GRL的alpha（逐渐增大）
             p = (epoch + batch_idx / len(dataloader)) / self.config.get('epochs', 100)
@@ -1271,7 +1519,7 @@ class Trainer:
             for batch in tqdm(dataloader, desc='评估中'):
                 visible = batch['visible'].to(self.device)
                 infrared = batch['infrared'].to(self.device)
-                env = self._metadata_to_tensor(batch.get('metadata', []), self.device)
+                env = self._metadata_to_tensor(batch.get('metadata', []), self.device) if self.use_env else None
                 
                 # 前向传播
                 outputs = self.model(visible, infrared, alpha=1.0, env=env)
@@ -1352,8 +1600,9 @@ class Trainer:
 
 def main():
     parser = argparse.ArgumentParser(description='创新点2 - 跨模态生成与残差检测')
-    parser.add_argument('--resume', type=str, default='/mnt/e/code/project/inno2/checkpoints/phase_a_best.pth',help='path to a phase A checkpoint to resume generator weights from')
-
+    #parser.add_argument('--resume', type=str, default='/mnt/e/code/project/inno2/checkpoints/phase_a_best.pth',help='path to a phase A checkpoint to resume generator weights from')
+    parser.add_argument('--resume', type=str, default='',
+                    help='path to a checkpoint to resume generator weights from (empty means train from scratch)')
     
     # 数据参数
     parser.add_argument('--csv_path', type=str, default='/mnt/e/code/project/inno2/inno2.csv')
@@ -1365,6 +1614,8 @@ def main():
     parser.add_argument('--base_channels', type=int, default=64)
     parser.add_argument('--style_dim', type=int, default=256)
     parser.add_argument('--num_blocks', type=int, default=4)
+    parser.add_argument('--env_mode', type=str, choices=['film', 'concat', 'none', 'attn'], default='film',
+                        help='环境先验融合方式')
     
     # 训练参数
     parser.add_argument('--epochs_phase_a', type=int, default=50, help='Phase A epochs')
@@ -1409,24 +1660,41 @@ def main():
                     #help='Phase B 权重线性热身占比，0.2表示前20%进度把权重从0→设定值')
 
     # Phase B 专用重构权重：更强调结构与高频
-    parser.add_argument('--lambda_l2_b', type=float, default=1.5)
+    '''parser.add_argument('--lambda_l2_b', type=float, default=1.5)
     parser.add_argument('--lambda_ssim_b', type=float, default=0.6)
     parser.add_argument('--lambda_tv_b', type=float, default=0.005)
     parser.add_argument('--lambda_perceptual_b', type=float, default=0.1)
     parser.add_argument('--lambda_grad_b', type=float, default=1.0)
     parser.add_argument('--lambda_lap_b', type=float, default=0.8)
     parser.add_argument('--lambda_edge_b', type=float, default=0.8)
-    parser.add_argument('--lambda_fft_b', type=float, default=0.0)
+    parser.add_argument('--lambda_fft_b', type=float, default=0.0)'''
+
+    # Phase B：结构/边缘/感知优先配置
+    parser.add_argument('--lambda_l2_b', type=float, default=2.0)    # 数值锚点
+    parser.add_argument('--lambda_ssim_b', type=float, default=1.0)  # 结构一致性
+    parser.add_argument('--lambda_tv_b', type=float, default=0.002)  # 轻平滑  
+    parser.add_argument('--lambda_perceptual_b', type=float, default=0.2)  # 感知（放大前）
+    parser.add_argument('--lambda_grad_b', type=float, default=1.0)  # 边缘
+    parser.add_argument('--lambda_lap_b', type=float, default=1.0)   # 高频纹理
+    parser.add_argument('--lambda_edge_b', type=float, default=1.0)  # 热斑边界
+    parser.add_argument('--lambda_fft_b', type=float, default=0.2)   # 频域细节
+
+
 
     
     # 其他
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_dir', type=str, default='/mnt/e/code/project/inno2/checkpoints')
+    parser.add_argument('--exp_id', type=str, default='exp_default', help='实验标识，用于隔离日志与权重')
     parser.add_argument('--use_wandb', action='store_true', help='Use W&B for logging')
+    parser.add_argument('--resume_strict', action='store_true',
+                        help='Load checkpoints with strict=True (default False for backward compatibility)')
     
     args = parser.parse_args()
     
     # 创建保存目录
+    base_save_dir = args.save_dir
+    args.save_dir = os.path.join(base_save_dir, args.exp_id)
     os.makedirs(args.save_dir, exist_ok=True)
     
     # 初始化W&B
@@ -1484,7 +1752,7 @@ def main():
     # 创建模型
     print("\n[2/3] 创建模型...")
     config = vars(args)
-    model = CrossModalGenerationModel(config)
+    model = CrossModalGenerationModel(config, env_mode=args.env_mode)
     
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
@@ -1498,7 +1766,13 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=args.device)
         state = ckpt.get('model_state_dict', ckpt)
-        trainer.model.load_state_dict(state, strict=True)
+        load_result = trainer.model.load_state_dict(state, strict=args.resume_strict)
+        if not args.resume_strict:
+            missing, unexpected = load_result
+            if missing:
+                print(f"[Resume] Missing keys (initialized from scratch): {missing}")
+            if unexpected:
+                print(f"[Resume] Unexpected keys (ignored): {unexpected}")
         print(f"Resumed generator weights from {args.resume} (epoch={ckpt.get('epoch')}, phase={ckpt.get('phase')})")
     
     # Phase A: 重构训练
@@ -1620,6 +1894,29 @@ def main():
     # 域判别器如果 Phase B 不再用 GAN，可以一并冻结
     for p in trainer.model.domain_discriminator.parameters():
         p.requires_grad = False
+
+
+    # ====== Phase B 重新初始化生成器优化器和学习率调度器 ======
+    if args.epochs_phase_b > 0:
+        # 只拿仍然 requires_grad=True 的参数（解码器 + 风格编码器）
+        trainable_params = [p for p in trainer.model.parameters() if p.requires_grad]
+
+        # 重新创建优化器：学习率可以适当再小一点，比如 5e-5，如果你想激进一点就用 args.lr_g
+        trainer.optimizer_g = torch.optim.Adam(
+            trainable_params,
+            lr=args.lr_g,            # 建议先用跟 Phase A 一样的 1e-4 试一轮
+            betas=(0.5, 0.999)
+        )
+
+        # 为 Phase B 单独建一个 Cosine 调度，周期就是 epochs_phase_b
+        trainer.scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(
+            trainer.optimizer_g,
+            T_max=max(1, args.epochs_phase_b)
+        )
+
+        print(f"Phase B: 重新初始化 optimizer_g 和 scheduler_g，"
+              f"trainable params = {sum(p.numel() for p in trainable_params)}")
+
 
 
     

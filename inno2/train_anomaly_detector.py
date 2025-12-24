@@ -146,7 +146,15 @@ class TeacherStudentDetector:
         for param in self.teacher.parameters():
             param.requires_grad = False
         
-        self.student = StudentNetwork().to(device)
+        #self.student = StudentNetwork().to(device)
+        # 动态推断 teacher 特征维度（避免 256/384 不匹配）
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224).to(device)  # 224 只是探测用，AdaptivePool 不怕尺寸
+            teacher_content = self._pick_feature(self.teacher.content_encoder(dummy))
+            teacher_dim = teacher_content.shape[1]          # 通道数
+            print(f"[Teacher-Student] teacher feature dim = {teacher_dim}")
+
+        self.student = StudentNetwork(feature_dim=teacher_dim).to(device)
         self.device = device
         
         # 记录正常分布
@@ -168,8 +176,11 @@ class TeacherStudentDetector:
                 
                 # Teacher特征（冻结）
                 with torch.no_grad():
-                    teacher_content = self.teacher.content_encoder(visible)
+                    #teacher_content = self.teacher.content_encoder(visible)
+                    #teacher_feat = F.adaptive_avg_pool2d(teacher_content, 1).view(visible.size(0), -1)
+                    teacher_content = self._pick_feature(self.teacher.content_encoder(visible))
                     teacher_feat = F.adaptive_avg_pool2d(teacher_content, 1).view(visible.size(0), -1)
+
                 
                 # Student预测
                 student_feat = self.student(visible)
@@ -202,7 +213,9 @@ class TeacherStudentDetector:
                 visible = batch['visible'].to(self.device)
                 
                 # Teacher特征
-                teacher_content = self.teacher.content_encoder(visible)
+                #teacher_content = self.teacher.content_encoder(visible)
+                #teacher_feat = F.adaptive_avg_pool2d(teacher_content, 1).view(visible.size(0), -1)
+                teacher_content = self._pick_feature(self.teacher.content_encoder(visible))
                 teacher_feat = F.adaptive_avg_pool2d(teacher_content, 1).view(visible.size(0), -1)
                 
                 all_features.append(teacher_feat.cpu().numpy())
@@ -236,7 +249,9 @@ class TeacherStudentDetector:
             visible_image = visible_image.to(self.device)
             
             # Teacher特征
-            teacher_content = self.teacher.content_encoder(visible_image)
+            #teacher_content = self.teacher.content_encoder(visible_image)
+            #teacher_feat = F.adaptive_avg_pool2d(teacher_content, 1).view(1, -1)
+            teacher_content = self._pick_feature(self.teacher.content_encoder(visible_image))
             teacher_feat = F.adaptive_avg_pool2d(teacher_content, 1).view(1, -1)
             teacher_feat = teacher_feat.cpu().numpy()[0]
             
@@ -263,6 +278,14 @@ class TeacherStudentDetector:
         self.normal_mu = checkpoint['normal_mu']
         self.normal_sigma = checkpoint['normal_sigma']
         print(f"✓ Teacher-Student检测器已加载: {path}")
+
+    def _pick_feature(self, feat):
+        # content_encoder 可能返回 (c1, c2, c3) 或 [c1, c2, c3]
+        if isinstance(feat, (tuple, list)):
+            # 通常最后一层语义最强
+            feat = feat[-1]
+        return feat
+
 
 
 # ===========================

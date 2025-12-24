@@ -52,7 +52,7 @@ class InferenceEngine:
         self.model.to(device)
         self.model.eval()
         
-        print(f"✓ 模型加载成功 (Epoch {checkpoint['epoch']}, Phase {checkpoint['phase']})")
+        print(f"模型加载成功 (Epoch {checkpoint['epoch']}, Phase {checkpoint['phase']})")
         
         # 图像预处理
         self.transform = transforms.Compose([
@@ -279,7 +279,7 @@ class InferenceEngine:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"✓ 可视化结果已保存: {output_path}")
+        print(f"可视化结果已保存: {output_path}")
 
 
 def main():
@@ -290,6 +290,20 @@ def main():
     parser.add_argument('--infrared', type=str, default=None, help='红外图像路径（可选，用于残差计算）')
     parser.add_argument('--output_dir', type=str, default='results', help='输出目录')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument(
+        "--advanced_method",
+        type=str,
+        default="none",
+        choices=["none", "density", "teacher_student"],
+        help="高级异常检测方法：density(需红外 residual) / teacher_student(仅需可见光)"
+    )
+    parser.add_argument(
+        "--advanced_model_path",
+        type=str,
+        default=None,
+        help="高级异常检测模型路径：density_estimator.pkl 或 teacher_student_detector.pth"
+    )
+
     
     args = parser.parse_args()
     
@@ -302,6 +316,22 @@ def main():
     
     # 创建推理引擎
     engine = InferenceEngine(args.checkpoint, args.device)
+    advanced_est = None
+    advanced_ts = None
+
+    if args.advanced_method != "none":
+        assert args.advanced_model_path is not None, "使用高级异常检测必须提供 --advanced_model_path"
+
+        if args.advanced_method == "density":
+            from train_anomaly_detector import GaussianDensityEstimator
+            advanced_est = GaussianDensityEstimator()
+            advanced_est.load(args.advanced_model_path)
+
+        elif args.advanced_method == "teacher_student":
+            from train_anomaly_detector import TeacherStudentDetector
+            advanced_ts = TeacherStudentDetector(engine.model, args.device)
+            advanced_ts.load(args.advanced_model_path)
+
     
     # 加载可见光图像
     print(f"\n加载可见光图像: {args.visible}")
@@ -310,13 +340,44 @@ def main():
     # 模式1: 仅生成红外
     if args.infrared is None:
         print("\n[模式1] 仅生成红外图像")
+
+        # 1) 生成红外
         generated_ir = engine.generate_infrared(visible_tensor)
-        
-        # 保存生成的红外
+
+        # 2) 如果启用了 Teacher-Student，就在这里做单输入异常检测
+        if args.advanced_method == "teacher_student":
+            advanced_score = float(advanced_ts.score(visible_tensor))
+            print("\n异常分数:")
+            print(f"  advanced: {advanced_score:.4f}")
+            print(f"  advanced_method: {args.advanced_method}")
+
+            # （可选）阈值判断：先给一个默认值，后续你应该用正常集统计阈值再填
+            threshold = 50.0
+            status = "异常" if advanced_score > threshold else "正常"
+            print(f"  判断结果(阈值={threshold}): {status}")
+
+            # （可选）保存分数报告
+            score_txt_path = os.path.join(args.output_dir, "anomaly_scores.txt")
+            with open(score_txt_path, "w") as f:
+                f.write("异常分数报告(Teacher-Student 单输入)\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"输入图像: {args.visible}\n")
+                f.write(f"advanced_method: {args.advanced_method}\n")
+                f.write(f"advanced_score: {advanced_score:.6f}\n")
+                f.write(f"threshold: {threshold}\n")
+                f.write(f"result: {status}\n")
+            print(f"分数报告已保存: {score_txt_path}")
+
+        elif args.advanced_method == "density":
+            # density 必须有红外 residual，所以这里直接报清楚原因
+            raise ValueError("density 高级异常检测必须提供 --infrared（需要 residual）")
+
+        # 3) 保存生成的红外
         output_path = os.path.join(args.output_dir, 'generated_infrared.jpg')
         generated_ir_img = engine.tensor_to_image(generated_ir)
         Image.fromarray(generated_ir_img).save(output_path)
-        print(f"✓ 生成红外已保存: {output_path}")
+        print(f"生成红外已保存: {output_path}")
+
     
     # 模式2: 残差检测
     else:
@@ -325,22 +386,56 @@ def main():
         
         print("\n[模式2] 残差异常检测")
         results = engine.compute_residual(visible_tensor, infrared_tensor)
+
+        advanced_score = None
+
+        if args.advanced_method == "density":
+            # density 必须要 residual → 所以必须有真实红外
+            assert infrared_tensor is not None, "density 高级异常检测必须输入 --infrared"
+            import torch.nn.functional as F
+
+            residual = results["residual"]  # [B,C,H,W]
+            if residual.size(1) != 1:
+                residual = residual.mean(dim=1, keepdim=True)
+            residual32 = F.interpolate(residual, size=(32, 32), mode="bilinear", align_corners=False)
+
+            vec = residual32.squeeze(0).squeeze(0).cpu().numpy()  # [32,32]
+            advanced_score = float(advanced_est.score(vec))
+
+        elif args.advanced_method == "teacher_student":
+            # TS 只需要 visible
+            advanced_score = float(advanced_ts.score(visible_tensor))
+
+        # 把高级分数写回结果，保持和原 inference 输出风格一致
+        results.setdefault("scores", {})
+        results["scores"]["advanced"] = advanced_score
+        results["advanced_method"] = args.advanced_method   # ✅ 放到 scores 外面
+
+
         
         print("\n异常分数:")
         for name, score in results['scores'].items():
-            print(f"  {name}: {score:.4f}")
+            if score is None:
+                print(f"  {name}: None")
+            else:
+                print(f"  {name}: {float(score):.4f}")
+
+        # 单独打印高级方法
+        if "advanced_method" in results:
+            print(f"  advanced_method: {results['advanced_method']}")
+
         
         # 保存生成的红外
         output_ir_path = os.path.join(args.output_dir, 'generated_infrared.jpg')
         generated_ir_img = engine.tensor_to_image(results['generated_ir'])
         Image.fromarray(generated_ir_img).save(output_ir_path)
-        print(f"\n✓ 生成红外已保存: {output_ir_path}")
+        print(f"\n生成红外已保存: {output_ir_path}")
         
         # 保存残差热力图
         heatmap_path = os.path.join(args.output_dir, 'residual_heatmap.jpg')
         heatmap = engine.create_heatmap(results['residual'])
         Image.fromarray(heatmap).save(heatmap_path)
-        print(f"✓ 残差热力图已保存: {heatmap_path}")
+        print(f"残差热力图已保存: {heatmap_path}")
         
         # 保存可视化
         viz_path = os.path.join(args.output_dir, 'visualization.png')
@@ -370,7 +465,7 @@ def main():
             f.write(f"\n判断结果 (阈值={threshold}): ")
             f.write("异常" if is_anomaly else "正常")
         
-        print(f"✓ 分数报告已保存: {score_txt_path}")
+        print(f"分数报告已保存: {score_txt_path}")
     
     print("\n" + "=" * 80)
     print("推理完成！")
