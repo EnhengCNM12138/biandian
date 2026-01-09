@@ -161,23 +161,3 @@ done | sort -k2 -nr > ranked_anomalies.txt
 | **推荐度** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
 
 **建议**：先用基础流程，如果效果不够再考虑高级流程！
-
----
-
-## FAQ
-
-**Q: 我必须运行 train_anomaly_detector.py 吗？**  
-A: ❌ 不需要！inference.py 已经可以检测异常。
-
-**Q: Phase C 能提升多少性能？**  
-A: 约 5-10% 的 AUC 提升，但需要额外训练时间。
-
-**Q: 如果我只想看热力图，用哪个？**  
-A: inference.py 就够了！
-
-**Q: 两个都运行会冲突吗？**  
-A: 不会，train_anomaly_detector.py 只是保存额外的检测器模型。
-
-**Q: 我该从哪个开始？**  
-A: 从基础流程开始！先跑通再优化。
-
